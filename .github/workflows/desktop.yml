@@ -1,0 +1,87 @@
+# Chart Desk desktop builds: Windows (x64 installer), macOS (Apple Silicon and Intel disk images) and Linux
+# (AppImage). Each runner builds its own platform: the app's web build, the chart server (Rust), and a standalone
+# Python with chartd (desktop/scripts/stage.py), packed by electron-builder. A tag v* makes a draft release with the
+# files; publishing the draft is done by hand.
+name: Desktop builds
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: --win
+          - os: macos-14
+            target: --mac --arm64
+          - os: macos-15-intel
+            target: --mac --x64
+          - os: ubuntu-22.04
+            target: --linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: app
+      - name: Drawing library (a sibling checkout the web build reads)
+        uses: actions/checkout@v4
+        with:
+          repository: deepentropy/lightweight-charts-drawing
+          ref: 2c50c6d47847bd95953aa6e98790405c7fd3460d
+          path: lightweight-charts-drawing
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            app/package-lock.json
+            app/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - uses: astral-sh/setup-uv@v6
+      - name: Linux build libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: App dependencies
+        working-directory: app
+        run: npm ci --ignore-scripts
+      - name: Stage the web build, the chart server and Python with chartd
+        working-directory: app
+        run: uv run --no-project --python 3.13 python desktop/scripts/stage.py
+      - name: Package
+        working-directory: app/desktop
+        run: |
+          npm ci
+          npx electron-builder ${{ matrix.target }} --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chartdesk-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            app/desktop/release/*.exe
+            app/desktop/release/*.dmg
+            app/desktop/release/*.AppImage
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*

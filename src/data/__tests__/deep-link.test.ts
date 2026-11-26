@@ -1,0 +1,35 @@
+import { describe, expect, it } from "vitest";
+import { linkedPost, openedLink, postOfLink } from "../deep-link";
+
+describe("opentrader:// links", () => {
+  it("reads a post's link", () => {
+    expect(linkedPost("opentrader://post/tkjs1al6fa")).toBe("tkjs1al6fa");
+    expect(linkedPost("opentrader://post/TKJS1AL6FA/")).toBe("tkjs1al6fa");
+    expect(linkedPost("opentrader://p/tkjs1al6fa?from=web")).toBe("tkjs1al6fa");
+  });
+  it("ignores anything else", () => {
+    for (const u of ["https://community.opentrader.markets/p/abc123", "opentrader://chart?symbol=NVDA", "opentrader://post/../x", "opentrader://post/"]) expect(linkedPost(u)).toBeNull();
+  });
+});
+
+describe("links the main menu opens from the clipboard", () => {
+  const site = "https://community.opentrader.markets";
+  it("reads an app link or a post's page", () => {
+    // Chart Desk: no community server, so a post link opens nothing.
+    expect(postOfLink("opentrader://post/tkjs1al6fa", site)).toBeNull();
+    expect(postOfLink(" https://community.opentrader.markets/p/TKJS1AL6FA/?x=1 ", site)).toBeNull();
+  });
+  it("ignores anything else", () => {
+    for (const u of ["", "hello", "https://community.opentrader.markets/", "https://community.opentrader.markets/p/", "https://example.com/p/abc123", "https://community.opentrader.markets/p/abc123/extra"])
+      expect(postOfLink(u, site)).toBeNull();
+  });
+});
+
+describe("links the app opens (#350)", () => {
+  it("tells a post from a chart", () => {
+    expect(openedLink("opentrader://post/tkjs1al6fa")).toBeNull(); // Chart Desk: no community server
+    expect(openedLink("opentrader://chart?symbol=ARRY&interval=60")).toEqual({ chart: { symbol: "ARRY", interval: "60" } });
+    expect(openedLink("https://demo.opentrader.markets/chart/?symbol=ARRY")).toEqual({ chart: { symbol: "ARRY" } });
+    expect(openedLink("hello")).toBeNull();
+  });
+});

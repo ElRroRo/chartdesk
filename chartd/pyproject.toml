@@ -1,0 +1,26 @@
+[project]
+name = "chartd"
+version = "0.1.0"
+description = "Chart Desk's local data server: Yahoo prices behind OpenTrader's Market API, cached on disk"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.10",
+    "curl_cffi>=0.7",
+    "numpy>=2.5.5",
+    "tzdata>=2024.1",  # Windows has no time-zone database for zoneinfo
+]
+
+[project.scripts]
+chartd = "chartd.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

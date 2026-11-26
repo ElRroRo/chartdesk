@@ -1,0 +1,18 @@
+Chart Desk
+Copyright (c) 2026 Chart Desk contributors
+
+Chart Desk is a fork of OpenTrader (https://github.com/deepentropy/opentrader),
+Copyright (c) 2026 OpenTrader contributors, MIT licence (see LICENSE).
+
+It draws its charts with TradingView Lightweight Charts(TM)
+(https://github.com/tradingview/lightweight-charts), Apache License 2.0:
+
+  TradingView Lightweight Charts(TM)
+  Copyright (c) 2025 TradingView, Inc. https://www.tradingview.com/
+
+and uses lightweight-charts-drawing (https://github.com/deepentropy/lightweight-charts-drawing), MIT licence.
+The credits are also shown in the app (tray or menu bar > About Chart Desk).
+
+Chart Desk is not affiliated with, endorsed by or connected to TradingView, Inc.
+Market data comes from public sources (Yahoo Finance, Binance, FRED, Is Yatirim, KAP, Nasdaq Trader and others),
+fetched by each user's own computer for their personal use. Nothing in Chart Desk is investment advice.

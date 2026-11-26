@@ -1,0 +1,188 @@
+/*
+ * Settings > About: version, update status and notices.
+ */
+import { createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
+import { Icon } from "../../../components/Icon";
+import { appUpdateStatus, buildInfo, checkForUpdates, installUpdate } from "../../../data/app-update";
+import type { BuildInfo, UpdateFailure } from "../../../bindings";
+import { COMMUNITY_ENABLED, COMMUNITY_URL } from "../../../data/community/api";
+import { ECONOMIC_DATA_NOTICE, ECONOMIC_DATA_TERMS_URL } from "../../../data/economic-notice";
+import { diagnosticsText } from "../../../data/diagnostics";
+import { openLink } from "./io";
+import { translateWith } from "../../../i18n/translator";
+
+export function AboutTab() {
+  const [info, setInfo] = createSignal<BuildInfo | null>(null);
+  onMount(() => {
+    void buildInfo().then(setInfo);
+    // The reference app checks for an update each time About opens.
+    checkForUpdates();
+  });
+  /** "2026-09-30" → "30/09/2026". */
+  const date = (iso: string) => iso.split("-").reverse().join("/");
+  return (
+    <div class="app-settings-about">
+      <div class="app-settings-about-app">OpenTrader</div>
+      <Show when={info()}>
+        {(i) => <div class="app-settings-about-version">{translateWith("Version {0} · {1}", i().version, date(i().buildDate))}</div>}
+      </Show>
+      {/* The reference app hides its update block on Linux (no in-app update there). */}
+      <Show when={!/Linux/.test(navigator.userAgent)}>
+        <UpdateAppBlock />
+      </Show>
+      <div class="app-settings-about-copyright">Copyright © 2026 OpenTrader</div>
+      <ReportProblem version={info()?.version} />
+      <Show when={COMMUNITY_ENABLED}>
+        <SuggestLink />
+      </Show>
+      <EconomicDataNotice />
+    </div>
+  );
+}
+
+/** Notice and terms of the economic data source (its API terms of use). */
+function EconomicDataNotice() {
+  return (
+    <div class="app-settings-about-notice">
+      <div data-no-translate>{ECONOMIC_DATA_NOTICE}</div>
+      <div>
+        By using the economic series in OpenTrader you agree to the{" "}
+        <a class="app-settings-about-link" href={ECONOMIC_DATA_TERMS_URL} onClick={(e) => { e.preventDefault(); openLink(ECONOMIC_DATA_TERMS_URL, "terms"); }}>
+          FRED® API Terms of Use
+        </a>
+        .
+      </div>
+    </div>
+  );
+}
+
+const NEW_BUG = "https://github.com/deepentropy/opentrader/issues/new?template=bug_report.yml";
+/** GitHub reads a form field's value from the address; past this length it refuses the page. */
+const MAX_URL = 7500;
+
+/** A bug report with what a fix needs to reproduce it: the issue form opened with the diagnostic info filled in, or
+ *  the info copied to paste (in an issue, or for a coding agent writing one: its get_diagnostics tool gives the same). */
+function ReportProblem(props: { version?: string }) {
+  const [copied, setCopied] = createSignal(false);
+  let timer: number | undefined;
+  onCleanup(() => window.clearTimeout(timer));
+  const copy = () =>
+    void diagnosticsText()
+      .then((text) => navigator.clipboard.writeText(text))
+      .then(() => {
+        setCopied(true);
+        window.clearTimeout(timer);
+        timer = window.setTimeout(() => setCopied(false), 2000);
+      })
+      .catch((e) => console.warn("[about] copy diagnostic info failed", e));
+  const report = () =>
+    void diagnosticsText().then((text) => {
+      let url = `${NEW_BUG}&diagnostics=${encodeURIComponent(text)}`;
+      if (props.version) url += `&version=${encodeURIComponent(props.version)}`;
+      openLink(url.length > MAX_URL ? NEW_BUG : url, "bug report");
+    });
+  return (
+    <div class="app-settings-about-report">
+      <span class="app-settings-about-notice">Found a bug? The report opens with the diagnostic info of this window filled in: check it before posting.</span>
+      <div class="app-settings-about-report-buttons">
+        <button type="button" class="app-settings-btn" onClick={report}>
+          Report a bug
+        </button>
+        <button type="button" class="app-settings-btn" onClick={copy}>
+          {copied() ? "Copied" : "Copy diagnostic info"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Members ask for features on the Community website, no GitHub account needed. */
+function SuggestLink() {
+  const url = `${COMMUNITY_URL}/suggestions`;
+  return (
+    <div class="app-settings-about-notice">
+      <span>
+        Missing something?{" "}
+        <a
+          class="app-settings-about-link"
+          href={url}
+          onClick={(e) => {
+            e.preventDefault();
+            openLink(url, "suggestions");
+          }}
+        >
+          Suggest a feature
+        </a>
+      </span>
+    </div>
+  );
+}
+
+/** Why the update check failed, under "Couldn't check for updates" (not in the reference app: a
+ *  proxy that the update can't use was invisible, #399). Other: the error itself. */
+const FAILURE_TEXT: Record<Exclude<UpdateFailure, "other">, string> = {
+  proxy: "The proxy of Settings > Network couldn't reach the update server",
+  connection: "No connection to the update server",
+  timeout: "The update server didn't answer in time",
+  server: "The update server didn't send the update",
+};
+
+/** The reference app's About update status block (`update-app`): one row per update state,
+ *  "Relaunch" once the new version is downloaded. */
+function UpdateAppBlock() {
+  const state = () => appUpdateStatus().state;
+  const failure = () => (state() === "error" ? appUpdateStatus().error : null);
+  const view = (): { text: string; icon: JSX.Element } => {
+    switch (state()) {
+      case "checking":
+        return { text: "Checking for updates", icon: <UpdateSpinner /> };
+      case "downloading":
+        return { text: "New version is downloading", icon: <Icon name="update-app-download" size={28} /> };
+      case "ready-to-install":
+        return { text: "Relaunch to update the app", icon: <Icon name="update-app-check" size={28}/> };
+      case "installing":
+        return { text: "Relaunching the app to install new version", icon: <Icon name="update-app-check" size={28}/> };
+      // The update check failed (offline, server down): checked again the
+      // next time About opens.
+      case "error":
+        return { text: "Couldn't check for updates", icon: <Icon name="update-app-error" size={28}/> };
+      default:
+        return { text: "OpenTrader is up to date", icon: <Icon name="update-app-check" size={28}/> };
+    }
+  };
+  return (
+    <div class={`update-app ${state()}`}>
+      <div class="update-app-text-container">
+        <div class="update-app-status-icon">{view().icon}</div>
+        <div class="update-app-status">
+          <span class="update-app-status-text">{view().text}</span>
+          <Show when={failure()}>
+            {(f) => (
+              <Show when={f().reason !== "other"} fallback={<span class="update-app-status-reason" data-no-translate>{f().detail}</span>}>
+                <span class="update-app-status-reason">{FAILURE_TEXT[f().reason as keyof typeof FAILURE_TEXT]}</span>
+              </Show>
+            )}
+          </Show>
+        </div>
+      </div>
+      <Show when={state() === "installing"}>
+        <UpdateSpinner />
+      </Show>
+      <Show when={state() === "ready-to-install"}>
+        <button type="button" class="update-app-relaunch" onClick={installUpdate}>
+          Relaunch
+        </button>
+      </Show>
+    </div>
+  );
+}
+
+/** The reference app ui-lib progress spinner, size small (24px), intent neutral. */
+function UpdateSpinner() {
+  return (
+    <svg class="update-app-spinner" width="24" height="24" viewBox="0 0 24 24" role="progressbar" aria-label="Loading">
+      <circle class="update-app-spinner-bg" cx="12" cy="12" r="11" />
+      <circle class="update-app-spinner-fg" cx="12" cy="12" r="11" />
+    </svg>
+  );
+}

@@ -1,0 +1,580 @@
+/*
+ * The OpenTrader gateway's implementation of the `DataProvider` traits.
+ *
+ * Thin forwarders to the `market_rest` / `quote_poll` / `market_stream`
+ * functions — no fetch logic lives here. The per-session disk cache, daily
+ * memo, and prior-session-close cache all stay inside `market_rest`, so
+ * they're carried for free; a future provider can add its own caching
+ * independently.
+ *
+ * Stateless: the struct holds nothing (the gateway token is compiled in and read
+ * per call inside `market_rest`), so it's trivially `Send + Sync` and cloneable.
+ */
+use super::capabilities::{
+    DataStatus, HistoryFloor, HistoryProbe, ProviderCapabilities, ReferenceCaps, ResolutionCaps,
+    StreamCaps,
+};
+use super::entitlements;
+use super::{DataProvider, HistoryProvider, RealtimeProvider, ReferenceProvider, SymbolChange};
+use crate::data::types::{
+    Candle, DividendEvent, FilingList, FilingQuery, FilingText, Fundamentals, NewsItem, RevenueBreakdown, Snapshot, SplitEvent, SymbolSearchResult, TickerInfo,
+    WsHandle,
+};
+use crate::data::session::{Subsession, SymbolSession};
+use crate::data::symbol::SymbolRef;
+use crate::data::market_rest::economics;
+use crate::data::{daily_archive, gateway, market_rest, market_stream, quote_poll, ticker_case, trading_calendar};
+use anyhow::Result;
+use chrono::{Datelike, NaiveDate, Utc};
+use std::sync::OnceLock;
+use crate::host::HostRef;
+
+pub struct GatewayProvider;
+
+#[async_trait::async_trait]
+impl HistoryProvider for GatewayProvider {
+    async fn daily_aggs(
+        &self,
+        sym: &SymbolRef,
+        from: NaiveDate,
+        to: NaiveDate,
+        adjusted: bool,
+    ) -> Result<Vec<Candle>> {
+        market_rest::fetch_daily_aggs(&ticker_case::to_source(&sym.ticker), from, to, adjusted).await
+    }
+    async fn daily_archive(&self, sym: &SymbolRef, adjusted: bool) -> Result<Vec<Candle>> {
+        daily_archive::daily_bars(&ticker_case::to_source(&sym.ticker), adjusted).await
+    }
+    async fn listing_date(&self, sym: &SymbolRef) -> Result<Option<NaiveDate>> {
+        Ok(market_rest::listing_date(&ticker_case::to_source(&sym.ticker)).await?)
+    }
+    async fn symbol_changes(&self, sym: &SymbolRef) -> Result<Vec<SymbolChange>> {
+        let changes = market_rest::ticker_changes(&ticker_case::to_source(&sym.ticker)).await?;
+        Ok(changes.iter().map(|(date, ticker)| SymbolChange { date: *date, ticker: ticker_case::to_app(ticker) }).collect())
+    }
+    async fn executed_splits(&self, sym: &SymbolRef) -> Result<Vec<SplitEvent>> {
+        Ok(market_rest::split_events(&ticker_case::to_source(&sym.ticker)).await?)
+    }
+    async fn paid_dividends(&self, sym: &SymbolRef) -> Result<Vec<DividendEvent>> {
+        Ok(market_rest::dividend_events(&ticker_case::to_source(&sym.ticker)).await?)
+    }
+    async fn minute_aggs(
+        &self,
+        sym: &SymbolRef,
+        mult: u32,
+        from: NaiveDate,
+        to: NaiveDate,
+        adjusted: bool,
+    ) -> Result<Vec<Candle>> {
+        market_rest::fetch_minute_aggs(&ticker_case::to_source(&sym.ticker), mult, from, to, adjusted).await
+    }
+    async fn second_aggs(
+        &self,
+        sym: &SymbolRef,
+        mult: u32,
+        from: NaiveDate,
+        to: NaiveDate,
+        adjusted: bool,
+    ) -> Result<Vec<Candle>> {
+        market_rest::fetch_second_aggs(&ticker_case::to_source(&sym.ticker), mult, from, to, adjusted).await
+    }
+    async fn second_tail(
+        &self,
+        sym: &SymbolRef,
+        mult: u32,
+        since_sec: f64,
+        adjusted: bool,
+    ) -> Result<Vec<Candle>> {
+        market_rest::fetch_second_tail(&ticker_case::to_source(&sym.ticker), mult, since_sec, adjusted).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ReferenceProvider for GatewayProvider {
+    async fn ticker_info(&self, sym: &SymbolRef) -> Result<TickerInfo> {
+        if economics::is_economic(&sym.exchange) {
+            return economic_info(sym).await;
+        }
+        ticker_shape(sym, "ticker details")?;
+        // Answered under the app's name, not the source's spelling.
+        let mut info = market_rest::fetch_ticker_info(&ticker_case::to_source(&sym.ticker)).await?;
+        info.ticker = sym.ticker.clone();
+        Ok(info)
+    }
+    async fn symbol_session(&self, sym: &SymbolRef) -> Result<SymbolSession> {
+        if economics::is_economic(&sym.exchange) {
+            return economic_session(sym).await;
+        }
+        // Chart Desk: futures, crypto and FX keep their own hours.
+        if let Some(s) = chartdesk_session(sym) {
+            return Ok(s);
+        }
+        let mut session = us_equity_session();
+        if sym.exchange == "OTC" {
+            session.variable_tick_size = OTC_TICKS.into();
+        }
+        Ok(session)
+    }
+    async fn ticker_snapshot(&self, sym: &SymbolRef) -> Result<Snapshot> {
+        if economics::is_economic(&sym.exchange) {
+            return economic_snapshot(sym).await;
+        }
+        ticker_shape(sym, "snapshot")?;
+        let mut snapshot = market_rest::fetch_ticker_snapshot(&ticker_case::to_source(&sym.ticker)).await?;
+        snapshot.ticker = sym.ticker.clone();
+        Ok(snapshot)
+    }
+    async fn search(
+        &self,
+        query: &str,
+        type_filter: Option<&str>,
+    ) -> Result<Vec<SymbolSearchResult>> {
+        market_rest::search_tickers(query, type_filter).await
+    }
+    async fn dividends(&self, sym: &SymbolRef) -> Result<Vec<DividendEvent>> {
+        if economics::is_economic(&sym.exchange) || !sym.could_be_ticker() {
+            return Ok(Vec::new());
+        }
+        Ok(market_rest::dividend_events(&ticker_case::to_source(&sym.ticker)).await?)
+    }
+    async fn splits(&self, sym: &SymbolRef) -> Result<Vec<SplitEvent>> {
+        if economics::is_economic(&sym.exchange) || !sym.could_be_ticker() {
+            return Ok(Vec::new());
+        }
+        Ok(market_rest::split_events(&ticker_case::to_source(&sym.ticker)).await?)
+    }
+    async fn latest_news(&self, sym: &SymbolRef, limit: u32) -> Vec<NewsItem> {
+        if economics::is_economic(&sym.exchange) || !sym.could_be_ticker() {
+            return Vec::new();
+        }
+        market_rest::latest_news(&ticker_case::to_source(&sym.ticker), limit).await
+    }
+    async fn icon(&self, encoded: &str) -> Result<(Vec<u8>, String)> {
+        market_rest::fetch_icon(encoded).await
+    }
+    async fn fundamentals(&self, sym: &SymbolRef) -> Result<std::sync::Arc<Fundamentals>> {
+        if economics::is_economic(&sym.exchange) {
+            anyhow::bail!("an economic series has no fundamentals");
+        }
+        ticker_shape(sym, "fundamentals")?;
+        Ok(market_rest::fetch_fundamentals(&ticker_case::to_source(&sym.ticker)).await?)
+    }
+    async fn filings(&self, sym: &SymbolRef, q: &FilingQuery) -> Result<FilingList> {
+        if economics::is_economic(&sym.exchange) {
+            anyhow::bail!("an economic series has no filings");
+        }
+        ticker_shape(sym, "filings")?;
+        Ok(market_rest::fetch_filings(&ticker_case::to_source(&sym.ticker), q).await?)
+    }
+    async fn filing_text(&self, sym: &SymbolRef, accn: &str, section: Option<&str>, offset: u32) -> Result<FilingText> {
+        if economics::is_economic(&sym.exchange) {
+            anyhow::bail!("an economic series has no filings");
+        }
+        ticker_shape(sym, "filing")?;
+        Ok(market_rest::fetch_filing_text(&ticker_case::to_source(&sym.ticker), accn, section, offset).await?)
+    }
+    async fn revenue_breakdown(&self, sym: &SymbolRef) -> Result<RevenueBreakdown> {
+        if economics::is_economic(&sym.exchange) {
+            anyhow::bail!("an economic series has no revenue breakdown");
+        }
+        ticker_shape(sym, "revenue breakdown")?;
+        Ok(market_rest::fetch_revenue_breakdown(&ticker_case::to_source(&sym.ticker)).await?)
+    }
+}
+
+/// A symbol that cannot name a security is answered "unknown" without asking
+/// the gateway (#355).
+fn ticker_shape(sym: &SymbolRef, what: &'static str) -> Result<()> {
+    if sym.could_be_ticker() {
+        Ok(())
+    } else {
+        Err(gateway::ApiError::unknown_symbol(what).into())
+    }
+}
+
+impl RealtimeProvider for GatewayProvider {
+    fn spawn(&self, host: HostRef) -> WsHandle {
+        // Two live tasks behind one handle:
+        //   • the REST snapshot poller — always: watchlist quotes (regular
+        //     Last, change, Ext) and the chart minute / day bars; the whole
+        //     live feed for a key without stream channels;
+        //   • the second-bars stream — only when the probe grants `bar1s` and
+        //     a chart is open: live bars for the seconds charts.
+        // The gateway holds the one upstream connection, so the stream task
+        // and `probe_stream` may be connected at the same time.
+        market_stream::fan_out(vec![
+            quote_poll::spawn(host.clone()),
+            market_stream::spawn_second_bars(host),
+        ])
+    }
+}
+
+/// Session of the US equities this provider serves (the app reads the
+/// stocks market only): 09:30-16:00 New York, extended 04:00-20:00, NYSE/NASDAQ
+/// holidays and early closes from the computed calendar (early-close days:
+/// regular 09:30-13:00, post-market 13:00-17:00, extended 04:00-17:00, as the
+/// reference app's corrections). Built once: the lists run from the calendar
+/// floor to next year.
+/// Chart Desk: sessions of the markets chartd adds, by the symbol's exchange (TradingView's names).
+fn chartdesk_session(sym: &SymbolRef) -> Option<SymbolSession> {
+    let plain = |timezone: &str, session: &str, pricescale: u32, minmov: u32, ticks: &str| SymbolSession {
+        timezone: timezone.into(),
+        session: session.into(),
+        subsessions: Vec::new(),
+        holidays: String::new(),
+        corrections: String::new(),
+        pricescale,
+        minmov,
+        variable_tick_size: ticks.into(),
+        intervals: Vec::new(),
+        bar_origin: None,
+        point_value: None,
+    };
+    match sym.exchange.as_str() {
+        // Crypto: every minute of every day, UTC days; ticks shrink with the price.
+        "BINANCE" => Some(plain("Etc/UTC", "24x7", 100_000_000, 1, "0.00000001 0.01 0.000001 1 0.0001 100 0.01")),
+        // A spread (chartd evaluates the formula over its legs' bars): no hours of its own.
+        "CALC" => Some(plain("America/New_York", "24x7", 10_000, 1, "")),
+        // A Python indicator's series (chartd computes it over a ticker's bars): the ticker's bars set its times.
+        "PY" => Some(plain("America/New_York", "24x7", 10_000, 1, "")),
+        // Borsa Istanbul: continuous trading 10:00-18:00 and the closing auction to 18:10.
+        "BIST" => Some(plain("Europe/Istanbul", "1000-1810:23456", 100, 1, "0.01 20 0.02 50 0.05 100 0.1 250 0.25 500 0.5 1000 1 2500 2.5")),
+        // TVC: the dollar index trades on ICE nearly round the clock; the US Treasury yields are FRED's daily values.
+        "TVC" => {
+            if sym.ticker.starts_with("US") && sym.ticker.len() == 5 {
+                let mut s = plain("America/New_York", "0000-2400:23456", 1000, 1, "");
+                s.intervals = vec!["1D".into()];
+                Some(s)
+            } else {
+                Some(plain("America/New_York", "2000-1700:23456", 1000, 1, ""))
+            }
+        }
+        // ICE US softs (cotton, coffee, sugar, cocoa): their day ends at 14:20 New York or earlier.
+        "ICEUS" => Some(plain("America/New_York", "2100-1420:23456", 100, 1, "")),
+        // CME Globex: Sunday 17:00 to Friday 16:00 Chicago, a break at 16:00 each day.
+        "CME" | "CME_MINI" | "CBOT" | "CBOT_MINI" | "NYMEX" | "COMEX" => {
+            let root = sym.ticker.trim_end_matches(|c: char| c == '!' || c.is_ascii_digit());
+            // Grains: an overnight session and a day session, a pause between.
+            if matches!(root, "ZC" | "ZS" | "ZW" | "ZL" | "ZM" | "ZR" | "KE") {
+                return Some(plain("America/Chicago", "1900-0745,0830-1320:23456", 400, 1, ""));
+            }
+            let (pricescale, minmov) = match root {
+                "ES" | "NQ" | "MES" | "MNQ" => (100, 25),
+                "YM" | "MYM" => (1, 1),
+                "RTY" | "M2K" | "GC" | "MGC" => (10, 1),
+                "NG" => (1000, 1),
+                "SI" => (1000, 5),
+                "HG" => (10000, 5),
+                "ZN" | "ZB" | "ZF" | "ZT" => (1_000_000, 1),
+                _ => (100, 1),
+            };
+            Some(plain("America/Chicago", "1700-1600:23456", pricescale, minmov, ""))
+        }
+        // FX: Sunday 17:00 to Friday 17:00 New York.
+        "FX" | "FX_IDC" => Some(plain("America/New_York", "1700-1700:23456", 100_000, 1, "0.00001 10 0.001")),
+        _ => None,
+    }
+}
+
+fn us_equity_session() -> SymbolSession {
+    static SESSION: OnceLock<SymbolSession> = OnceLock::new();
+    SESSION
+        .get_or_init(|| {
+            let (from, to) = (trading_calendar::floor_year(), Utc::now().year() + 1);
+            let early = trading_calendar::early_closes_spec(from, to);
+            let corrected = |id: &str, name: &str, session: &str, short_day: &str| Subsession {
+                corrections: format!("{short_day}:{early}"),
+                ..Subsession::new(id, name, session)
+            };
+            SymbolSession {
+                timezone: "America/New_York".into(),
+                // 0.01, and 0.0001 under 1 (the reference app's US stock grid).
+                pricescale: 100,
+                minmov: 1,
+                variable_tick_size: "0.0001 1 0.01".into(),
+                session: "0930-1600".into(),
+                subsessions: vec![
+                    corrected("regular", "Regular Trading Hours", "0930-1600", "0930-1300"),
+                    corrected("extended", "Extended Trading Hours", "0400-2000", "0400-1700"),
+                    Subsession::new("premarket", "Premarket", "0400-0930"),
+                    corrected("postmarket", "Postmarket", "1600-2000", "1300-1700"),
+                ],
+                holidays: trading_calendar::holidays_spec(from, to),
+                corrections: format!("0930-1300:{early}"),
+                intervals: Vec::new(),
+                bar_origin: None,
+                point_value: None,
+            }
+        })
+        .clone()
+}
+
+// ── Economic series ──────────────────────────────────────────────────────
+
+/// Unit label of a series on the price scale: "%" for percentages, "USD" for
+/// dollar amounts, none for indexes and counts.
+fn economic_unit(units: &str) -> Option<String> {
+    let u = units.to_lowercase();
+    if u == "%" || u.starts_with("percent") {
+        Some("%".into())
+    } else if u.contains('$') || u.contains("dollars") {
+        Some("USD".into())
+    } else {
+        None
+    }
+}
+
+/// Reference data of an economic series: its title, the agency (shown where
+/// the exchange is) and its unit.
+async fn economic_info(sym: &SymbolRef) -> Result<TickerInfo> {
+    let meta = match economics::meta(&sym.ticker) {
+        Some(m) => m,
+        None => economics::fetch_series(&sym.ticker).await?.meta.clone(),
+    };
+    Ok(TickerInfo {
+        ticker: sym.ticker.clone(),
+        name: Some(meta.name.clone()),
+        exchange: Some(meta.source.clone()),
+        industry: None,
+        sector: None,
+        currency: economic_unit(&meta.units).or_else(|| economic_unit(&meta.units_short)),
+        description: Some(format!("{} ({}, {})", meta.name, meta.units, meta.seasonal)),
+        homepage_url: None,
+        total_employees: None,
+        market_cap: None,
+        figi: None,
+        symbol_type: Some("economic".into()),
+        security_type: Some("economic".into()),
+        icon_url: None,
+        delay_minutes: None,
+        data_source: Some(meta.source.clone()),
+    })
+}
+
+/// Decimals of a value as written (shortest form), at most 6.
+fn decimals(v: f64) -> u32 {
+    let s = format!("{v}");
+    s.split_once('.').map_or(0, |(_, d)| d.len().min(6) as u32)
+}
+
+/// An economic series trades "every day" (one observation per date, 00:00
+/// UTC); its price grid follows the decimals of its recent values.
+async fn economic_session(sym: &SymbolRef) -> Result<SymbolSession> {
+    let series = economics::fetch_series(&sym.ticker).await?;
+    let dec = series.value.iter().rev().take(60).map(|&v| decimals(v)).max().unwrap_or(2);
+    Ok(SymbolSession {
+        timezone: "Etc/UTC".into(),
+        session: "24x7".into(),
+        subsessions: vec![Subsession::new("regular", "Regular Trading Hours", "24x7")],
+        holidays: String::new(),
+        corrections: String::new(),
+        pricescale: 10u32.pow(dec),
+        minmov: 1,
+        variable_tick_size: String::new(),
+        intervals: Vec::new(),
+        bar_origin: None,
+        point_value: None,
+    })
+}
+
+/// Last value of an economic series and its change from the observation before.
+async fn economic_snapshot(sym: &SymbolRef) -> Result<Snapshot> {
+    let s = economics::fetch_series(&sym.ticker).await?;
+    let n = s.value.len();
+    let last = *s.value.last().ok_or_else(|| anyhow::anyhow!("no observation"))?;
+    let prev = if n > 1 { s.value[n - 2] } else { last };
+    let change = last - prev;
+    Ok(Snapshot {
+        ticker: sym.ticker.clone(),
+        last,
+        change,
+        change_percent: if prev != 0.0 { change / prev.abs() * 100.0 } else { 0.0 },
+        day_high: last,
+        day_low: last,
+        day_volume: 0.0,
+        ext_change_percent: None,
+        source: "prev".into(),
+        updated_ms: s.time.last().copied().unwrap_or(0.0) * 1000.0,
+    })
+}
+
+/// Tick bands of OTC listings (the reference app's OTC:TCEHY grid).
+const OTC_TICKS: &str = "0.000001 0.0001 0.0001 1 0.01";
+
+/// Ticker used by the entitlement probes: listed long before any plan's
+/// history floor, so its first bar marks the plan floor.
+const PROBE_TICKER: &str = "AAPL";
+
+/// Delay of the delayed data: 15 minutes (gateway doc, `delayed`).
+const DELAYED_SEC: u32 = 15 * 60;
+
+#[async_trait::async_trait]
+impl DataProvider for GatewayProvider {
+    fn name(&self) -> &'static str {
+        super::DEFAULT_PROVIDER
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            name: self.name().to_string(),
+            // The multipliers this app is wired for (the datafeed's lookback
+            // tables). The aggregates endpoint accepts any multiplier; serving
+            // more is a separate decision.
+            resolutions: ResolutionCaps {
+                // Chart Desk: chartd serves Yahoo's 1 / 5 / 15-minute and hourly
+                // bars (1m: 7 days, 5m/15m: 60 days, 1h: 2 years, kept and
+                // growing); other sizes are built from these. No seconds.
+                seconds: vec![],
+                minutes: vec![1, 5, 15, 60],
+                daily: true,
+                weekly_monthly_from_daily: true,
+            },
+            max_bars_per_request: 50_000,
+            adjusted_toggle: true,
+            extended_hours: true,
+            reference: ReferenceCaps {
+                search: true,
+                search_type_filter: true,
+                snapshot: true,
+                dividends: true,
+                splits: true,
+                news: true,
+                icons: true,
+            },
+            entitlements: None,
+        }
+    }
+
+    fn credential_id(&self) -> Option<String> {
+        // Gateway + token: a new gateway or a rotated token re-probes.
+        // The shared token: an install token arriving mid-run is no new credential.
+        // A subscriber's pass (#252) is another plan: real-time, probed and cached apart.
+        let tier = if crate::data::pass::realtime() { "|rt" } else { "" };
+        gateway::shared_token().map(|t| entitlements::fingerprint(&format!("{}|{t}{tier}", gateway::BASE)))
+    }
+
+    async fn probe_history(&self) -> Result<HistoryProbe> {
+        let (day, minute, second) = tokio::join!(
+            market_rest::probe_oldest_bar(PROBE_TICKER, "day"),
+            market_rest::probe_oldest_bar(PROBE_TICKER, "minute"),
+            market_rest::probe_oldest_bar(PROBE_TICKER, "second"),
+        );
+        let (day, delayed) = day?;
+        let fmt = |d: Option<chrono::NaiveDate>| d.map(|d| d.format("%Y-%m-%d").to_string());
+        // A failing sub-daily probe (`NOT_ENTITLED` included) leaves that
+        // floor unknown rather than failing the whole probe.
+        let minute = minute.map_err(|e| eprintln!("[entitlements] minute probe: {e}")).ok().and_then(|(d, _)| d);
+        let second = second.map_err(|e| eprintln!("[entitlements] second probe: {e}")).ok().and_then(|(d, _)| d);
+        // `delayed` of a range reaching today: true on the delayed plan
+        // (seen 15/10/2026), false on a real-time one.
+        let (data_status, delay_sec) =
+            if delayed { (DataStatus::DelayedStreaming, DELAYED_SEC) } else { (DataStatus::Streaming, 0) };
+        Ok(HistoryProbe {
+            data_status,
+            raw_status: if delayed { "delayed" } else { "realtime" }.into(),
+            delay_sec,
+            floor: HistoryFloor {
+                second: fmt(second),
+                minute: fmt(minute),
+                day: fmt(day),
+            },
+        })
+    }
+
+    /// The stream route follows the pass (`market_stream::connect_authed`), not
+    /// `data_status`.
+    async fn probe_stream(&self, _data_status: DataStatus) -> Result<StreamCaps> {
+        let channels = ["bar1m:", "bar1s:", "trade:", "quote:"].map(|p| format!("{p}{PROBE_TICKER}"));
+        let granted = market_stream::probe_channels(&channels).await?;
+        Ok(StreamCaps {
+            minute_bars: granted[0],
+            second_bars: granted[1],
+            trades: granted[2],
+            quotes: granted[3],
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The static resolution set must equal the datafeed's lookback tables
+    /// (src/data/datafeed.ts SECOND_INTERVALS / INTRADAY_INTERVALS /
+    /// DAILY_INTERVALS), so the capabilities call changes nothing on screen.
+    #[test]
+    fn static_resolutions_match_datafeed_tables() {
+        let r = GatewayProvider.capabilities().resolutions;
+        assert!(r.seconds.is_empty()); // Chart Desk: no second bars
+        assert_eq!(r.minutes, vec![1, 5, 15, 60]);
+        assert!(r.daily && r.weekly_monthly_from_daily);
+    }
+
+    /// The US session matches the reference app's symbol info for US stocks
+    /// (NASDAQ:AAPL, NYSE:IBM resolved 01/10/2026): New York, regular
+    /// 09:30-16:00, extended 04:00-20:00, and the same 2025-2026 holidays.
+    #[test]
+    fn us_equity_session_matches_reference() {
+        let s = us_equity_session();
+        assert_eq!(s.timezone, "America/New_York");
+        assert_eq!(s.session, "0930-1600");
+        let ext = s.subsessions.iter().find(|x| x.id == "extended").unwrap();
+        assert_eq!(ext.session, "0400-2000");
+        let reference = "20250101,20250120,20250217,20250418,20250526,20250619,20250704,20250901,20251127,20251225,\
+                         20260101,20260119,20260216,20260403,20260525,20260619,20260703,20260907,20261126,20261225";
+        let ours: Vec<&str> = s
+            .holidays
+            .split(',')
+            // 09/01/2025 is a "dayoff" correction in the reference, not a holiday.
+            .filter(|d| *d >= "20250101" && *d < "20270101" && *d != "20250109")
+            .collect();
+        assert_eq!(ours.join(","), reference);
+        // 09/01/2025 (a one-off day off in the reference corrections) is closed.
+        assert!(s.holidays.contains("20250109"));
+    }
+
+    /// Early closes match the reference app's US correction list for 2019 and
+    /// 2021-2026 (its list has no 2020 entries; 2027 differs, see
+    /// trading_calendar). Hours as its corrections.
+    #[test]
+    fn us_equity_early_closes_match_reference() {
+        let s = us_equity_session();
+        let reference = "20190703,20191129,20191224,20211126,20221125,20230703,20231124,20240703,\
+                         20241129,20241224,20250703,20251128,20251224,20261127,20261224";
+        let dates = s.corrections.trim_start_matches("0930-1300:");
+        let ours: Vec<&str> = dates
+            .split(',')
+            .filter(|d| (*d >= "20190101" && *d < "20200101") || (*d >= "20210101" && *d < "20270101"))
+            .collect();
+        assert_eq!(ours.join(","), reference);
+        let sub = |id: &str| s.subsessions.iter().find(|x| x.id == id).unwrap().corrections.clone();
+        assert!(sub("regular").starts_with("0930-1300:"));
+        assert!(sub("postmarket").starts_with("1300-1700:"));
+        assert!(sub("extended").starts_with("0400-1700:"));
+    }
+
+    /// Price grid as the reference app's US stocks (AAPL, IBM: 100 / 1,
+    /// "0.0001 1 0.01") and OTC listings (TCEHY), resolved 01/10/2026.
+    #[test]
+    fn us_equity_price_grid_matches_reference() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let aapl = rt.block_on(GatewayProvider.symbol_session(&SymbolRef::parse("NASDAQ:AAPL"))).unwrap();
+        assert_eq!((aapl.pricescale, aapl.minmov, aapl.variable_tick_size.as_str()), (100, 1, "0.0001 1 0.01"));
+        let otc = rt.block_on(GatewayProvider.symbol_session(&SymbolRef::parse("OTC:TCEHY"))).unwrap();
+        assert_eq!(otc.variable_tick_size, "0.000001 0.0001 0.0001 1 0.01");
+    }
+
+    /// Live entitlement probe through the gateway (token compiled in by
+    /// build.rs). Run with:
+    ///   cargo test --lib live_entitlement_probe -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore = "hits the real REST + WebSocket endpoints; run explicitly"]
+    async fn live_entitlement_probe() {
+        assert!(gateway::token().is_some(), "{}", gateway::NO_TOKEN);
+        let h = GatewayProvider.probe_history().await.expect("history probe");
+        eprintln!("history: {:?} {} delay={} floor={:?}", h.data_status, h.raw_status, h.delay_sec, h.floor);
+        assert!(h.floor.day.is_some(), "no daily floor");
+        let s = GatewayProvider.probe_stream(h.data_status).await.expect("stream probe");
+        eprintln!("stream: {s:?}");
+    }
+}

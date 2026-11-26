@@ -1,0 +1,58 @@
+{
+  "name": "chartdesk",
+  "productName": "Chart Desk",
+  "version": "0.1.0",
+  "description": "Charting desktop app: charts, drawings, indicators, screener and alerts on free market data, all on your computer.",
+  "author": "Chart Desk contributors",
+  "license": "MIT",
+  "homepage": "https://github.com/ElRroRo/chartdesk",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.5.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "io.github.elrroro.chartdesk",
+    "productName": "Chart Desk",
+    "executableName": "chartdesk",
+    "directories": { "output": "release", "buildResources": "build" },
+    "files": ["main.js", "package.json"],
+    "asar": true,
+    "extraResources": [
+      { "from": "stage/web", "to": "web" },
+      { "from": "stage/bin", "to": "bin" },
+      { "from": "stage/python", "to": "python" },
+      { "from": "build/icon.png", "to": "icon.png" }
+    ],
+    "afterPack": "scripts/after-pack.js",
+    "publish": null,
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "artifactName": "ChartDesk-${version}-Windows-x64-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Chart Desk"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "category": "public.app-category.finance",
+      "identity": null,
+      "artifactName": "ChartDesk-${version}-macOS-${arch}.${ext}"
+    },
+    "dmg": { "sign": false },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Office",
+      "artifactName": "ChartDesk-${version}-Linux-x86_64.${ext}"
+    }
+  }
+}

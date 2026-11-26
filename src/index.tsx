@@ -1,0 +1,100 @@
+/* @refresh reload */
+// An embedded chart swaps the page storage before anything reads it (#338).
+import "./embed/boot";
+import "./styles.css";
+import { hydrateKv } from "./data/kv";
+import { installOverflowTooltip } from "./components/overflow-tooltip";
+import { installBrowserMenuBlock } from "./components/browser-menu";
+import { installErrorReports } from "./data/error-reports";
+import { installNewBuildCheck } from "./data/new-build";
+import { embedConfig } from "./embed/config";
+
+// App errors from the start, startup included; sent once the statistics start.
+installErrorReports();
+// Web: code that no longer loads because a new build is out offers a reload.
+installNewBuildCheck();
+
+// A tooltip on menu labels only when they are cut.
+installOverflowTooltip();
+// No web-view menu (Back, Reload, Save as…) on a right-click.
+installBrowserMenuBlock();
+
+// Hydrate the persistence layer BEFORE App (and its module graph) loads: many
+// modules seed signals/stores from kv synchronously at import time, so the
+// in-memory mirror must be populated first. App is dynamically imported so its
+// dependency graph isn't evaluated until hydration resolves. hydrateKv always
+// resolves (it falls back to localStorage on failure), so .finally is enough.
+void hydrateKv().finally(async () => {
+  // Chart Desk: a TradingView setup captured on this machine is imported once, before any store reads kv.
+  const { maybeImportTradingView } = await import("./chartdesk/tradingview-import");
+  await maybeImportTradingView().catch((e) => console.warn("[chartdesk] TradingView import failed", e));
+  // Restart: main may take over a saved window's tabs (window session).
+  const { adoptSavedWindowTabs } = await import("./window/shell/window-bridge");
+  await adoptSavedWindowTabs();
+  // Update state for the title bar, main menu and Settings > About.
+  const { initAppUpdate } = await import("./data/app-update");
+  initAppUpdate();
+  // The run's app zoom (a window opened after a change takes it).
+  const { initAppZoom } = await import("./data/app-zoom");
+  initAppZoom();
+  // The interface language, before anything is drawn.
+  const { startTranslation } = await import("./i18n/language");
+  await startTranslation().finally(() => document.getElementById("splash")?.classList.add("is-translated"));
+  const { render } = await import("solid-js/web");
+  // The screener's own window (placement "Separate window") holds the screener only.
+  if (new URLSearchParams(location.search).get("view") === "screener") {
+    const { ScreenerWindow } = await import("./window/screener/ScreenerWindow");
+    render(() => <ScreenerWindow />, document.getElementById("root") as HTMLElement);
+    hideSplash();
+    return;
+  }
+  // The OakScript editor's own window (#325, "Open editor ▸ New window") holds the editor only.
+  if (new URLSearchParams(location.search).get("view") === "oakscript") {
+    const { OakScriptWindow } = await import("./window/oakscript/OakScriptWindow");
+    render(() => <OakScriptWindow />, document.getElementById("root") as HTMLElement);
+    hideSplash();
+    return;
+  }
+  // An embedded widget (#339) holds that widget only (index.html shows no splash in an embed).
+  const embed = embedConfig();
+  if (embed && embed.widget !== "chart") {
+    const { EmbedWidget } = await import("./embed/widgets/EmbedWidget");
+    render(() => <EmbedWidget config={embed} />, document.getElementById("root") as HTMLElement);
+    const { initAnalytics } = await import("./data/analytics");
+    initAnalytics();
+    return;
+  }
+  const { default: App } = await import("./App");
+  render(() => <App />, document.getElementById("root") as HTMLElement);
+  hideSplash();
+  // The indicator library is not part of the first download: it loads now,
+  // after the first render (a chart showing one of its studies asks for it
+  // already).
+  const { loadIndicatorLibrary } = await import("./window/chart/indicators/registry");
+  void loadIndicatorLibrary();
+  // Anonymous usage statistics (reads kv, so after hydration).
+  const { initAnalytics } = await import("./data/analytics");
+  initAnalytics();
+  // Chart Desk: chartd keeps the price alerts going while the app is closed.
+  const { startAlertSync } = await import("./chartdesk/alert-sync");
+  startAlertSync();
+  // Chart Desk: the Python indicators of ~/chartdesk/indicators as scripts.
+  const { startPySync } = await import("./chartdesk/py-sync");
+  startPySync();
+});
+
+/** Minimum time the startup splash stays up, from page start, so its delay
+ *  warning can be read. The App renders and loads data underneath meanwhile. */
+const SPLASH_MIN_MS = 1500;
+
+/** Fade out the startup splash (index.html) once the App has rendered and the
+ *  minimum time has passed. */
+function hideSplash(): void {
+  const splash = document.getElementById("splash");
+  if (!splash) return;
+  const fade = () => {
+    splash.classList.add("is-hidden");
+    splash.addEventListener("transitionend", () => splash.remove(), { once: true });
+  };
+  window.setTimeout(fade, Math.max(0, SPLASH_MIN_MS - performance.now()));
+}

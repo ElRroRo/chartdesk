@@ -58,6 +58,9 @@ jobs:
       - name: Stage the web build, the chart server and Python with chartd
         working-directory: app
         run: uv run --no-project --python 3.13 python desktop/scripts/stage.py
+      - name: Smoke test (the staged chartd and chart server start and fetch AAPL and BTCUSDT)
+        working-directory: app
+        run: uv run --no-project --python 3.13 python desktop/scripts/smoke.py
       - name: Package
         working-directory: app/desktop
         run: |
